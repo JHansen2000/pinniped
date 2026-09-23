@@ -64,6 +64,7 @@ import (
 	"go.pinniped.dev/internal/fositestoragei"
 	"go.pinniped.dev/internal/here"
 	"go.pinniped.dev/internal/httputil/httperr"
+	"go.pinniped.dev/internal/idtransform"
 	"go.pinniped.dev/internal/oidcclientsecretstorage"
 	"go.pinniped.dev/internal/plog"
 	"go.pinniped.dev/internal/psession"
@@ -6205,4 +6206,124 @@ func TestMaybeOverrideDefaultRefreshTokenLifetime(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSessionStorageLifetimeHonorsSessionLifetimeOverride(t *testing.T) {
+	const (
+		upstreamName               = "some-oidc-idp"
+		upstreamResourceUID        = "oidc-resource-uid"
+		upstreamRefreshToken       = "initial-upstream-refresh-token"
+		sessionLifetimeOverride    = 7 * 24 * time.Hour
+		accessTokenStoragePadding  = 2 * time.Minute
+		refreshTokenStoragePadding = 2 * time.Minute
+	)
+
+	upstreamProvider := oidctestutil.NewTestUpstreamOIDCIdentityProviderBuilder().
+		WithName(upstreamName).
+		WithResourceUID(upstreamResourceUID).
+		WithValidatedAndMergedWithUserInfoTokens(&oidctypes.Token{
+			IDToken: &oidctypes.IDToken{
+				Claims: map[string]any{"sub": goodUpstreamSubject},
+			},
+		}).
+		WithRefreshedTokens(&oauth2.Token{
+			AccessToken:  "fake-refreshed-upstream-access-token",
+			RefreshToken: "fake-refreshed-upstream-refresh-token",
+			Expiry:       time.Now().Add(time.Hour),
+		}).
+		Build()
+
+	idpLister := &fakeIDPListerForRefreshTokenLifetimeTest{
+		idps: []resolvedprovider.FederationDomainResolvedIdentityProvider{
+			&resolvedoidc.FederationDomainResolvedOIDCIdentityProvider{
+				DisplayName:             upstreamName,
+				Provider:                upstreamProvider,
+				SessionProviderType:     psession.ProviderTypeOIDC,
+				Transforms:              idtransform.NewTransformationPipeline(),
+				SessionLifetimeOverride: sessionLifetimeOverride,
+			},
+		},
+	}
+
+	kubeClient := kubefake.NewClientset()
+	supervisorClient := supervisorfake.NewSimpleClientset()
+	secrets := kubeClient.CoreV1().Secrets("some-namespace")
+	oidcClientsClient := supervisorClient.ConfigV1alpha1().OIDCClients("some-namespace")
+
+	timeoutsConfiguration := oidc.DefaultOIDCTimeoutsConfiguration()
+	oauthStore := storage.NewKubeStorage(secrets, oidcClientsClient, timeoutsConfiguration, bcrypt.MinCost)
+
+	auditLogger, _ := plog.TestAuditLogger(t)
+
+	authRequest := deepCopyRequestForm(happyAuthRequest)
+	authRequest.Form.Set("scope", "openid offline_access username groups")
+
+	oauthHelper, authCode, _ := makeHappyOauthHelper(t,
+		authRequest,
+		oauthStore,
+		generateJWTSigningKeyAndJWKSProvider,
+		&psession.CustomSessionData{
+			Username:         goodUsername,
+			UpstreamUsername: goodUsername,
+			UpstreamGroups:   goodGroups,
+			ProviderName:     upstreamName,
+			ProviderUID:      upstreamResourceUID,
+			ProviderType:     psession.ProviderTypeOIDC,
+			OIDC: &psession.OIDCSessionData{
+				UpstreamRefreshToken: upstreamRefreshToken,
+				UpstreamSubject:      goodUpstreamSubject,
+				UpstreamIssuer:       goodIssuer,
+			},
+		},
+		nil,
+	)
+
+	subject := NewHandler(
+		idpLister,
+		oauthHelper,
+		timeoutsConfiguration.OverrideDefaultAccessTokenLifespan,
+		timeoutsConfiguration.OverrideDefaultIDTokenLifespan,
+		auditLogger,
+	)
+
+	// posts the given form to the token endpoint and returns the tokens from a successful response.
+	callTokenEndpoint := func(t *testing.T, requestBody body) (accessToken string, refreshToken string, approxRequestTime time.Time) {
+		t.Helper()
+
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/path/shouldn't/matter", requestBody.ReadCloser())
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req, _ = auditid.NewRequestWithAuditID(req, func() string { return "fake-audit-id" })
+		rsp := httptest.NewRecorder()
+
+		approxRequestTime = time.Now()
+		subject.ServeHTTP(rsp, req)
+		require.Equal(t, http.StatusOK, rsp.Code, "unexpected response body: %q", rsp.Body.String())
+
+		var parsedResponseBody map[string]any
+		require.NoError(t, json.Unmarshal(rsp.Body.Bytes(), &parsedResponseBody))
+
+		return parsedResponseBody["access_token"].(string), parsedResponseBody["refresh_token"].(string), approxRequestTime
+	}
+
+	const delta = 30 * time.Second
+
+	t.Run("the authcode exchange stores the new session for as long as the session may last", func(t *testing.T) {
+		accessToken, refreshToken, approxRequestTime := callTokenEndpoint(t, happyAuthcodeRequestBody(authCode))
+
+		requireGarbageCollectTimeInDelta(t, accessToken, "access-token", secrets,
+			approxRequestTime.Add(sessionLifetimeOverride).Add(accessTokenStoragePadding), delta)
+		requireGarbageCollectTimeInDelta(t, refreshToken, "refresh-token", secrets,
+			approxRequestTime.Add(sessionLifetimeOverride).Add(refreshTokenStoragePadding), delta)
+
+		require.Greater(t, sessionLifetimeOverride, 9*time.Hour, "this test is only meaningful when the override is longer than the default")
+
+		t.Run("and so does a subsequent refresh", func(t *testing.T) {
+			refreshedAccessToken, refreshedRefreshToken, approxRefreshTime := callTokenEndpoint(t, happyRefreshRequestBody(refreshToken))
+
+			requireGarbageCollectTimeInDelta(t, refreshedAccessToken, "access-token", secrets,
+				approxRefreshTime.Add(sessionLifetimeOverride).Add(accessTokenStoragePadding), delta)
+			requireGarbageCollectTimeInDelta(t, refreshedRefreshToken, "refresh-token", secrets,
+				approxRefreshTime.Add(sessionLifetimeOverride).Add(refreshTokenStoragePadding), delta)
+		})
+	})
 }
